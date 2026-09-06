@@ -30,7 +30,7 @@ param(
 
     [Parameter(ParameterSetName = 'Install')]
     [ValidatePattern('^3\.\d+(\.\d+)?$')]
-    [string]$PythonVersion = '3.13',
+    [string]$PythonVersion = '3.14',
 
     [Parameter(ParameterSetName = 'Install')]
     [Parameter(ParameterSetName = 'Check')]
@@ -189,13 +189,101 @@ function Get-SystemPythonPath {
     return $null
 }
 
+function Find-LocalPythonInstaller {
+    param([Parameter(Mandatory)][string]$RequestedVersion)
+
+    $majorMinor = (($RequestedVersion -split '\.')[0..1] -join '.')
+
+    # This setup package targets 64-bit Windows, as does the bundled VS Code
+    # installer. Search beside this script so a BAT launched from another
+    # directory still uses the installers distributed with the package.
+    $pattern = "python-$majorMinor.*-amd64.exe"
+    $candidates = @(Get-ChildItem `
+        -LiteralPath $PSScriptRoot `
+        -Filter $pattern `
+        -File `
+        -ErrorAction SilentlyContinue)
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    # Prefer the newest installer when more than one patch release is present.
+    $selected = $candidates |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    return [string]$selected.FullName
+}
+
+function Test-TrustedPythonInstaller {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $subject = $signature.SignerCertificate.Subject
+        if (($signature.Status -eq 'Valid') -and ($subject -match 'CN=Python Software Foundation(?:,|$)')) {
+            return $true
+        }
+
+        Write-Warning ("Ignoring local Python installer because its signature is invalid or is not issued to Python Software Foundation: {0}" -f $Path)
+    }
+    catch {
+        Write-Warning ("Ignoring local Python installer because its signature could not be checked: {0}" -f $Path)
+    }
+
+    return $false
+}
+
+function Install-LocalPython {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string]$RequestedVersion
+    )
+
+    $majorMinor = (($RequestedVersion -split '\.')[0..1] -join '.')
+    Write-Stage "Installing official Python $majorMinor from local installer"
+    Write-Host ('Local Python installer found: {0}' -f $InstallerPath) -ForegroundColor Green
+
+    if ($PSCmdlet.ShouldProcess($InstallerPath, 'Install Python for the current user')) {
+        $process = Start-Process `
+            -FilePath $InstallerPath `
+            -ArgumentList @('/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_test=0') `
+            -Wait `
+            -PassThru
+
+        if ($process.ExitCode -ne 0) {
+            throw ('Local Python installer finished with exit code {0}: {1}' -f $process.ExitCode, $InstallerPath)
+        }
+    }
+
+    # The installer updates the user PATH, but the current process does not
+    # necessarily inherit that change. Locate the interpreter directly.
+    Start-Sleep -Seconds 2
+    $pythonPath = Get-SystemPythonPath -RequestedVersion $majorMinor
+    if ($null -eq $pythonPath) {
+        throw "Python $majorMinor appears to have been installed from the local installer, but python.exe could not be located. Close this window and run the BAT again."
+    }
+
+    return $pythonPath
+}
+
 function Install-OfficialPython {
     param([Parameter(Mandatory)][string]$RequestedVersion)
 
     $majorMinor = (($RequestedVersion -split '\.')[0..1] -join '.')
+
+    # Prefer an installer shipped beside the setup script. Do not execute an
+    # arbitrary EXE: it must match the requested Python minor version and have
+    # a valid Python Software Foundation signature.
+    $localInstaller = Find-LocalPythonInstaller -RequestedVersion $majorMinor
+    if (($null -ne $localInstaller) -and (Test-TrustedPythonInstaller -Path $localInstaller)) {
+        return Install-LocalPython -InstallerPath $localInstaller -RequestedVersion $majorMinor
+    }
+
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     if ($null -eq $winget) {
-        throw 'Python is not installed and winget is not available. Install App Installer/winget or install Python manually from python.org.'
+        throw 'Python is not installed, no valid local installer was found, and winget is not available. Install App Installer/winget or place an official Python installer beside this script.'
     }
 
     $packageId = "Python.Python.$majorMinor"
@@ -860,6 +948,15 @@ try {
     Write-Host ('Python used: {0}' -f $pythonPath) -ForegroundColor Green
     if ($PyData) {
         Write-Host 'In VS Code, select: .venv\Scripts\python.exe' -ForegroundColor Green
+    }
+    else {
+        Write-Host ''
+        Write-Host 'Create and open a new Python project:' -ForegroundColor Green
+        Write-Host '  mkdir my-python-project'
+        Write-Host '  cd my-python-project'
+        Write-Host '  uv init'
+        Write-Host '  uv sync'
+        Write-Host '  code .'
     }
 }
 catch {

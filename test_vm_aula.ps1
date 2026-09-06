@@ -31,18 +31,35 @@ function Write-Stage {
 }
 
 function Get-RequiredSourceFiles {
-    $files = @(
+    $requiredFiles = @(
         (Join-Path $PSScriptRoot 'setup_python_environment.ps1'),
         (Join-Path $PSScriptRoot 'run_setup_python_environment.bat'),
         (Join-Path $PSScriptRoot 'VSCodeUserSetup-x64-1.136.0.exe')
     )
 
-    $missing = @($files | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+    $missing = @($requiredFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
     if ($missing.Count -gt 0) {
         throw "Required staging files are missing:`n$($missing -join "`n")"
     }
 
-    return $files
+    # Python installers are optional: when present, stage every x64 installer
+    # beside the setup script so setup_python_environment.ps1 can use the one
+    # matching its requested Python version without downloading it with winget.
+    $localPythonInstallers = @(Get-ChildItem `
+        -LiteralPath $PSScriptRoot `
+        -Filter 'python-*-amd64.exe' `
+        -File `
+        -ErrorAction SilentlyContinue |
+        Sort-Object Name)
+
+    if ($localPythonInstallers.Count -gt 0) {
+        Write-Host ("Local Python installers to stage: {0}" -f ($localPythonInstallers.Name -join ', ')) -ForegroundColor Green
+    }
+    else {
+        Write-Host 'No local Python installer found; the guest setup will fall back to winget.' -ForegroundColor Yellow
+    }
+
+    return @($requiredFiles + $localPythonInstallers.FullName)
 }
 
 function Connect-GuestSession {
